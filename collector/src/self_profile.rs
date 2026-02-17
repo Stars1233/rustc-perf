@@ -178,30 +178,36 @@ impl SelfProfileStorage for LocalSelfProfileStorage {
 #[cfg(feature = "s3-sdk")]
 #[derive(Clone)]
 struct S3WriteContext {
-    client: aws_sdk_s3::Client,
+    client: object_store::aws::AmazonS3,
 }
 
 #[cfg(feature = "s3-sdk")]
 impl S3WriteContext {
     async fn new() -> Self {
-        use aws_sdk_s3::config::retry::RetryConfig;
-        use aws_sdk_s3::config::timeout::TimeoutConfig;
         use std::time::Duration;
 
-        let region = aws_config::Region::new("us-west-1");
-        let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(region)
-            .retry_config(RetryConfig::standard().with_max_attempts(3))
-            .timeout_config(
-                TimeoutConfig::builder()
-                    .connect_timeout(Duration::from_secs(15))
-                    .read_timeout(Duration::from_secs(15))
-                    .operation_attempt_timeout(Duration::from_secs(60))
-                    .build(),
-            )
-            .load()
-            .await;
-        let client = aws_sdk_s3::Client::new(&shared_config);
+        let mut retry_config = object_store::RetryConfig::default();
+        retry_config.retry_timeout = Duration::from_secs(60 * 2);
+        retry_config.max_retries = 3;
+
+        let key_id = std::env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID is not set");
+        let key_secret =
+            std::env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY is not set");
+
+        let client_config = object_store::client::ClientOptions::new()
+            .with_timeout(Duration::from_secs(15))
+            .with_connect_timeout(Duration::from_secs(15))
+            .with_pool_idle_timeout(Duration::from_secs(15));
+
+        let client = object_store::aws::AmazonS3Builder::new()
+            .with_region("us-west-1")
+            .with_bucket_name("rustc-perf")
+            .with_retry(retry_config)
+            .with_client_options(client_config)
+            .with_secret_access_key(key_secret)
+            .with_access_key_id(key_id)
+            .build()
+            .expect("Could not build S3 client");
         Self { client }
     }
 }
@@ -228,6 +234,8 @@ impl SelfProfileStorage for S3SelfProfileStorage {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
         #[cfg(feature = "s3-sdk")]
         {
+            use object_store::ObjectStore;
+
             let ctx = self.write_ctx.clone();
             Box::pin(async move {
                 let file_path = _id.relative_file_path();
@@ -268,20 +276,22 @@ impl SelfProfileStorage for S3SelfProfileStorage {
                 log::info!("Uploading self-profile to {}", file_path.display());
 
                 let start = Instant::now();
-                let body = aws_sdk_s3::primitives::ByteStream::from_body_1_x(
-                    aws_sdk_s3::primitives::SdkBody::from(compressed),
+                let mut attributes = object_store::Attributes::new();
+                attributes.insert(
+                    object_store::Attribute::StorageClass,
+                    "INTELLIGENT_TIERING".into(),
                 );
                 ctx.client
-                    .put_object()
-                    .bucket("rustc-perf")
-                    .key(
-                        file_path
-                            .to_str()
-                            .expect("Non UTF-8 path used for self-profile"),
+                    .put_opts(
+                        &object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap(),
+                        object_store::PutPayload::from(compressed),
+                        object_store::PutOptions {
+                            mode: object_store::PutMode::Overwrite,
+                            tags: Default::default(),
+                            attributes,
+                            extensions: Default::default(),
+                        },
                     )
-                    .storage_class(aws_sdk_s3::types::StorageClass::IntelligentTiering)
-                    .body(body)
-                    .send()
                     .await
                     .context("s3 upload failed")?;
                 log::trace!(
