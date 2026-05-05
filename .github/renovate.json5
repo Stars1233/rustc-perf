@@ -4,6 +4,10 @@
     "github>rust-lang/renovate",
     "docker:disable",
   ],
+  ignorePaths: [
+    "collector/compile-benchmarks/**",
+    "collector/runtime-benchmarks/**",
+  ],
   "lockFileMaintenance": {
     "extends": ["schedule:monthly"]
   },
